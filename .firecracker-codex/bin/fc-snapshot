@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$HOME/.firecracker-codex/bin/fc-env"
+
+NAME="${1:-base}"
+DIR="$FC_SNAPSHOTS/$NAME"
+
+mkdir -p "$DIR"
+
+echo "Syncing guest filesystem..."
+
+ssh \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -i "$FC_SSH_KEY" \
+    root@"$FC_GUEST_IP" \
+    sync
+
+echo "Pausing VM..."
+
+fc_api \
+    -X PATCH \
+    -d '{"state":"Paused"}' \
+    http://localhost/vm
+
+echo "Creating memory/device snapshot..."
+
+fc_api \
+    -X PUT \
+    -d "{
+        \"snapshot_type\": \"Full\",
+        \"snapshot_path\": \"$DIR/vmstate.snap\",
+        \"mem_file_path\": \"$DIR/memory.snap\"
+    }" \
+    http://localhost/snapshot/create
+
+echo "Copying disk state..."
+
+cp --reflink=auto \
+    "$FC_ROOTFS" \
+    "$DIR/rootfs.ext4"
+
+sync
+
+echo
+echo "Snapshot created:"
+echo "    $NAME"
+echo
+echo "Restore with:"
+echo "    fc-restore $NAME"

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+
+source "$HOME/.firecracker-codex/bin/fc-env"
+
+if [[ -f "$FC_PIDFILE" ]]; then
+    PID="$(cat "$FC_PIDFILE")"
+
+    if kill -0 "$PID" 2>/dev/null; then
+        kill "$PID"
+        wait "$PID" 2>/dev/null || true
+    fi
+
+    rm -f "$FC_PIDFILE"
+fi
+
+rm -f "$FC_SOCKET"
+
+sudo ip link del "$FC_TAP" 2>/dev/null || true
+

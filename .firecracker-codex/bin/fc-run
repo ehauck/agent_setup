@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$HOME/.firecracker-codex/bin/fc-env"
+
+[[ -f "$FC_KERNEL" ]] || {
+    echo "Run fc-fresh first."
+    exit 1
+}
+
+[[ -f "$FC_ROOTFS" ]] || {
+    echo "Run fc-fresh first."
+    exit 1
+}
+
+fc-stop 2>/dev/null || true
+fc-net
+
+rm -f "$FC_SOCKET"
+
+firecracker \
+    --api-sock "$FC_SOCKET" \
+    >"$FC_RUN/firecracker.log" 2>&1 &
+
+FC_PID=$!
+echo "$FC_PID" > "$FC_PIDFILE"
+
+for _ in {1..100}; do
+    [[ -S "$FC_SOCKET" ]] && break
+    sleep 0.05
+done
+
+[[ -S "$FC_SOCKET" ]] || {
+    echo "Firecracker API socket did not appear."
+    exit 1
+}
+
+fc_api -X PUT \
+    -d "{
+        \"vcpu_count\": $FC_VCPUS,
+        \"mem_size_mib\": $FC_MEM_MIB
+    }" \
+    http://localhost/machine-config
+
+fc_api -X PUT \
+    -d "{
+        \"kernel_image_path\": \"$FC_KERNEL\",
+        \"boot_args\": \"console=ttyS0 reboot=k panic=1 pci=off\"
+    }" \
+    http://localhost/boot-source
+
+fc_api -X PUT \
+    -d "{
+        \"drive_id\": \"rootfs\",
+        \"path_on_host\": \"$FC_ROOTFS\",
+        \"is_root_device\": true,
+        \"is_read_only\": false
+    }" \
+    http://localhost/drives/rootfs
+
+fc_api -X PUT \
+    -d "{
+        \"iface_id\": \"net1\",
+        \"guest_mac\": \"$FC_MAC\",
+        \"host_dev_name\": \"$FC_TAP\"
+    }" \
+    http://localhost/network-interfaces/net1
+
+fc_api -X PUT \
+    -d '{
+        "action_type": "InstanceStart"
+    }' \
+    http://localhost/actions
+echo "Waiting for guest SSH..."
+
+for _ in {1..60}; do
+    if ssh \
+        -o ConnectTimeout=1 \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -i "$FC_SSH_KEY" \
+        root@"$FC_GUEST_IP" \
+        true 2>/dev/null
+    then
+        break
+    fi
+
+    sleep 0.5
+done
+
+echo "Configuring guest networking..."
+
+ssh \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -i "$FC_SSH_KEY" \
+    root@"$FC_GUEST_IP" \
+    "
+    ip route replace default via $FC_HOST_IP dev eth0
+
+    cat >/etc/resolv.conf <<'EOF'
+nameserver 8.8.8.8
+options single-request-reopen
+EOF
+    "
+
+echo
+echo "VM running."
+echo "PID: $FC_PID"
+echo
+echo "Use:"
+echo "    fc-ssh"
+

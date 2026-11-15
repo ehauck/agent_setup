@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$HOME/.firecracker-codex/bin/fc-env"
+
+NAME="${1:-base}"
+DIR="$FC_SNAPSHOTS/$NAME"
+
+[[ -f "$DIR/vmstate.snap" ]] || {
+    echo "Snapshot '$NAME' does not exist."
+    exit 1
+}
+
+fc-stop 2>/dev/null || true
+
+echo "Restoring disk..."
+
+cp --reflink=auto \
+    "$DIR/rootfs.ext4" \
+    "$FC_ROOTFS"
+
+fc-net
+
+rm -f "$FC_SOCKET"
+
+firecracker \
+    --api-sock "$FC_SOCKET" \
+    >"$FC_RUN/firecracker.log" 2>&1 &
+
+FC_PID=$!
+echo "$FC_PID" > "$FC_PIDFILE"
+
+for _ in {1..100}; do
+    [[ -S "$FC_SOCKET" ]] && break
+    sleep 0.05
+done
+
+[[ -S "$FC_SOCKET" ]] || {
+    echo "Firecracker API socket did not appear."
+    exit 1
+}
+
+echo "Loading snapshot..."
+
+fc_api \
+    -X PUT \
+    -d "{
+        \"snapshot_path\": \"$DIR/vmstate.snap\",
+        \"mem_backend\": {
+            \"backend_path\": \"$DIR/memory.snap\",
+            \"backend_type\": \"File\"
+        },
+        \"track_dirty_pages\": false,
+        \"resume_vm\": true
+    }" \
+    http://localhost/snapshot/load
+
+echo
+echo "Restored snapshot '$NAME'."
+echo
+echo "Use:"
+echo "    fc-ssh"

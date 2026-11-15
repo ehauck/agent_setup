@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+
+export FC_HOME="$HOME/.firecracker-codex"
+export FC_IMAGES="$FC_HOME/images"
+export FC_SNAPSHOTS="$FC_HOME/snapshots"
+export FC_RUN="$FC_HOME/run"
+
+export FC_SOCKET="$FC_RUN/firecracker.sock"
+export FC_PIDFILE="$FC_RUN/firecracker.pid"
+
+export FC_KERNEL="$FC_IMAGES/vmlinux"
+export FC_ROOTFS="$FC_IMAGES/rootfs.ext4"
+export FC_SSH_KEY="$FC_IMAGES/id_rsa"
+
+export FC_TAP="fc-tap0"
+export FC_HOST_IP="172.16.0.1"
+export FC_GUEST_IP="172.16.0.2"
+export FC_MAC="06:00:AC:10:00:02"
+
+export FC_VCPUS=4
+export FC_MEM_MIB=8100
+
+fc_api() {
+    curl --silent --show-error --fail \
+        --unix-socket "$FC_SOCKET" \
+        -H 'Content-Type: application/json' \
+        "$@"
+}

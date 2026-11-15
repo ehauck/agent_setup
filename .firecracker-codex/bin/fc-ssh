@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+source "$HOME/.firecracker-codex/bin/fc-env"
+
+ssh \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -i "$FC_SSH_KEY" \
+    root@"$FC_GUEST_IP"

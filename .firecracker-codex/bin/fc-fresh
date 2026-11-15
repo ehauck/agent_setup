@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$HOME/.firecracker-codex/bin/fc-env"
+
+mkdir -p "$FC_IMAGES" "$FC_SNAPSHOTS" "$FC_RUN"
+
+echo "[1/5] Installing host dependencies..."
+
+sudo apt-get update
+sudo apt-get install -y \
+    curl \
+    wget \
+    jq \
+    iproute2 \
+    iptables \
+    squashfs-tools \
+    e2fsprogs \
+    openssh-client \
+    acl
+
+echo "[2/5] Checking KVM..."
+
+if [[ ! -e /dev/kvm ]]; then
+    echo "ERROR: /dev/kvm does not exist."
+    echo "Firecracker requires KVM."
+    exit 1
+fi
+
+sudo setfacl -m "u:${USER}:rw" /dev/kvm
+
+if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+    echo "ERROR: no read/write access to /dev/kvm"
+    exit 1
+fi
+
+echo "KVM access OK."
+
+echo "[3/5] Installing latest Firecracker..."
+
+ARCH="$(uname -m)"
+
+case "$ARCH" in
+    x86_64|aarch64)
+        ;;
+    *)
+        echo "ERROR: unsupported architecture: $ARCH"
+        exit 1
+        ;;
+esac
+
+RELEASE_URL="https://github.com/firecracker-microvm/firecracker/releases"
+
+LATEST="$(
+    basename "$(
+        curl -fsSLI \
+            -o /dev/null \
+            -w '%{url_effective}' \
+            "$RELEASE_URL/latest"
+    )"
+)"
+
+echo "Firecracker release: $LATEST"
+
+TMP="$(mktemp -d /tmp/fc-fresh.XXXXXX)"
+
+cleanup() {
+    echo "Cleaning temporary directory..."
+    sudo rm -rf "$TMP"
+}
+trap cleanup EXIT INT TERM
+
+curl -fL \
+    "$RELEASE_URL/download/$LATEST/firecracker-$LATEST-$ARCH.tgz" \
+    -o "$TMP/firecracker.tgz"
+
+tar -xzf "$TMP/firecracker.tgz" -C "$TMP"
+
+FC_BINARY="$TMP/release-$LATEST-$ARCH/firecracker-$LATEST-$ARCH"
+
+if [[ ! -f "$FC_BINARY" ]]; then
+    echo "ERROR: Firecracker binary not found:"
+    echo "    $FC_BINARY"
+    exit 1
+fi
+
+sudo install \
+    -m 0755 \
+    "$FC_BINARY" \
+    /usr/local/bin/firecracker
+
+firecracker --version
+
+echo "[4/5] Downloading Firecracker CI kernel/rootfs..."
+
+cd "$TMP"
+
+S3="https://s3.amazonaws.com/spec.ccfc.min"
+
+CI_PREFIX="$(
+    curl -fsSL \
+        "$S3?list-type=2&prefix=firecracker-ci/&delimiter=/" |
+    grep -oP \
+        '(?<=<Prefix>)firecracker-ci/[0-9]{8}-[^/]+/(?=</Prefix>)' |
+    sort |
+    tail -1
+)"
+
+if [[ -z "$CI_PREFIX" ]]; then
+    echo "ERROR: could not determine Firecracker CI image prefix."
+    exit 1
+fi
+
+echo "CI image prefix: $CI_PREFIX"
+
+KERNEL_KEY="$(
+    curl -fsSL \
+        "$S3?list-type=2&prefix=${CI_PREFIX}${ARCH}/vmlinux-" |
+    grep -oP \
+        "(?<=<Key>)(${CI_PREFIX}${ARCH}/vmlinux-[0-9]+\.[0-9]+\.[0-9]{1,3})(?=</Key>)" |
+    sort -V |
+    tail -1
+)"
+
+if [[ -z "$KERNEL_KEY" ]]; then
+    echo "ERROR: could not find a Firecracker kernel."
+    exit 1
+fi
+
+UBUNTU_KEY="$(
+    curl -fsSL \
+        "$S3?list-type=2&prefix=${CI_PREFIX}${ARCH}/ubuntu-" |
+    grep -oP \
+        "(?<=<Key>)(${CI_PREFIX}${ARCH}/ubuntu-[0-9]+\.[0-9]+\.squashfs)(?=</Key>)" |
+    sort -V |
+    tail -1
+)"
+
+if [[ -z "$UBUNTU_KEY" ]]; then
+    echo "ERROR: could not find a Firecracker Ubuntu rootfs."
+    exit 1
+fi
+
+echo "Kernel:"
+echo "    $KERNEL_KEY"
+
+echo "Ubuntu rootfs:"
+echo "    $UBUNTU_KEY"
+
+echo "Downloading kernel..."
+
+wget \
+    -q \
+    --show-progress \
+    -O "$FC_KERNEL" \
+    "$S3/$KERNEL_KEY"
+
+echo "Downloading Ubuntu rootfs..."
+
+wget \
+    -q \
+    --show-progress \
+    -O "$TMP/ubuntu.squashfs" \
+    "$S3/$UBUNTU_KEY"
+
+if [[ ! -s "$FC_KERNEL" ]]; then
+    echo "ERROR: downloaded kernel is empty."
+    exit 1
+fi
+
+if [[ ! -s "$TMP/ubuntu.squashfs" ]]; then
+    echo "ERROR: downloaded rootfs is empty."
+    exit 1
+fi
+
+echo "[5/5] Creating writable persistent rootfs..."
+
+#
+# Extract as root because the SquashFS contains files belonging
+# to root and other system users.
+#
+sudo unsquashfs \
+    -d "$TMP/squashfs-root" \
+    "$TMP/ubuntu.squashfs"
+
+#
+# Create a dedicated SSH key for this VM.
+#
+rm -f \
+    "$FC_SSH_KEY" \
+    "$FC_SSH_KEY.pub"
+
+ssh-keygen \
+    -q \
+    -t ed25519 \
+    -f "$FC_SSH_KEY" \
+    -N ""
+
+#
+# Install public key into root's authorized_keys.
+#
+sudo mkdir -p \
+    "$TMP/squashfs-root/root/.ssh"
+
+sudo cp \
+    "$FC_SSH_KEY.pub" \
+    "$TMP/squashfs-root/root/.ssh/authorized_keys"
+
+sudo chown \
+    root:root \
+    "$TMP/squashfs-root/root/.ssh" \
+    "$TMP/squashfs-root/root/.ssh/authorized_keys"
+
+sudo chmod \
+    700 \
+    "$TMP/squashfs-root/root/.ssh"
+
+sudo chmod \
+    600 \
+    "$TMP/squashfs-root/root/.ssh/authorized_keys"
+
+#
+# Remove an old rootfs if fc-fresh is being run again.
+#
+if [[ -e "$FC_ROOTFS" ]]; then
+    echo "Removing existing rootfs:"
+    echo "    $FC_ROOTFS"
+
+    rm -f "$FC_ROOTFS"
+fi
+
+#
+# Create a sparse 16 GiB filesystem image.
+#
+echo "Creating 16 GiB sparse rootfs..."
+
+truncate \
+    -s 16G \
+    "$FC_ROOTFS"
+
+#
+# Build ext4 directly from the extracted Ubuntu tree.
+#
+echo "Populating ext4 filesystem..."
+
+sudo mkfs.ext4 \
+    -F \
+    -L rootfs \
+    -d "$TMP/squashfs-root" \
+    "$FC_ROOTFS"
+
+#
+# mkfs was executed as root, but we want the image to remain
+# manageable by the normal host user.
+#
+sudo chown \
+    "$USER:$USER" \
+    "$FC_ROOTFS"
+
+chmod 600 \
+    "$FC_ROOTFS" \
+    "$FC_SSH_KEY"
+
+echo
+echo "=========================================="
+echo " Firecracker VM successfully created"
+echo "=========================================="
+echo
+echo "Kernel:"
+echo "    $FC_KERNEL"
+echo
+echo "Root filesystem:"
+echo "    $FC_ROOTFS"
+echo
+echo "SSH key:"
+echo "    $FC_SSH_KEY"
+echo
+echo "Sizes:"
+du -h "$FC_KERNEL" "$FC_ROOTFS"
+echo
+echo "Next:"
+echo
+echo "    fc-run"
+echo
+echo "then:"
+echo
+echo "    fc-ssh"
+echo
